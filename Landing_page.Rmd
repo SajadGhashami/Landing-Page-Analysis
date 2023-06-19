@@ -1,0 +1,381 @@
+---
+title: "Landing Page Version 4.0 using current_url"
+author: "Sajad Ghashami"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+   html_document:
+     code_folding: hide
+     theme: cerulean
+---
+
+```{=html}
+<style type="text/css">
+.main-container {
+  max-width: 1400px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = 'center')
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+library(tidyverse)
+library(DBI)
+library(rmarkdown)
+library(ggpubr)
+library(data.table)
+library(knitr)
+library(plotly)
+library(rsconnect)
+library(reactable)
+library(moments)
+library(downloadthis)
+library(DT)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+con <- DBI::dbConnect(odbc::odbc(),
+                      #Snowflake
+                      #SnowflakeDSIIDriver
+                      Driver       = "SnowflakeDSIIDriver",
+                      Server       = "ed87949.us-east-1.snowflakecomputing.com",
+                      UID          = "SHINY_APP",
+                      PWD          =  "5UK@cMGTf2xA",
+                      
+                      # UID          = rstudioapi::askForPassword("Database user"),
+                      # PWD          = rstudioapi::askForPassword("Database password"),
+                      Database     = "EDW",
+                      Warehouse    = "shiny_app",
+                      Schema       = "dim"
+                      #,
+                      #authenticator = "externalbrowser"
+                      )
+mywh <- DBI::dbSendQuery(con, 'use role shiny_app_role')
+#mywh <- DBI::dbSendQuery(con, 'use role developer_role')
+mywh <- DBI::dbSendQuery(con, 'use warehouse shiny_app')
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+top <- DBI::dbGetQuery(con,
+"
+SELECT * 
+FROM ANALYTICS.SANDBOX.landing_page_top_current_url
+     ")
+
+```
+
+## Query to create the historical Path
+
+Click `Code/Hide` to Show/hide it
+
+```{r eval=FALSE}
+"
+CREATE OR REPLACE TABLE ANALYTICS.SANDBOX.landing_page_base_third_version_2023_06_02 AS
+WITH all_records AS (
+    
+    SELECT
+        event_name,
+        event_type,
+        description,
+        es.user_id,
+        es.date_created,
+        es.object_id,
+        CASE 
+        WHEN es.path LIKE '/read/%' THEN '/read/'
+        ELSE es.path
+        END
+        AS new_path,
+        es.date_created AS session_timestamp
+    FROM data_hub.kinesis.event_stream es
+    -- etl.user_id_merges and data_hub.etl.user_id_merges suddenly stopped working so I am using EDW_STAGING_DEVELOPMENT
+        LEFT JOIN EDW_STAGING_DEVELOPMENT.STAGING.USER_ID_MERGES  uim ON uim.from_user_id = es.user_id 
+        JOIN dim.users u ON u.user_id = COALESCE(uim.to_user_id, es.user_id)
+    WHERE es.user_id IS NOT NULL
+         AND es.date_created >= '2023-01-01'
+         AND es.date_created < current_date()         
+         AND es.path IS NOT NULL
+         AND es.event_name='Page View'
+         AND u.is_teacher= TRUE
+
+         
+)
+, engagement_intervals AS (
+    SELECT
+        al.event_name,
+        al.event_type,
+        al.description,
+        al.user_id,
+        al.date_created,
+        al.new_path,
+        al.session_timestamp,
+        (extract(epoch from session_timestamp) - lag(extract(epoch from session_timestamp)) OVER (PARTITION BY user_id ORDER BY session_timestamp))/60 AS minutes_since_last_interval,
+        CASE WHEN extract(epoch FROM session_timestamp) - lag(extract(epoch FROM session_timestamp)) OVER (PARTITION BY user_id ORDER BY session_timestamp) > 30 * 60 THEN 1 ELSE 0 END AS new_event_boundary
+    FROM   all_records AS al
+        
+)
+
+    SELECT
+        ei.event_name,
+        ei.event_type,
+        ei.description,
+        ei.user_id,
+        ei.date_created,
+        ei.new_path as path,
+        ei.session_timestamp,
+        SUM(new_event_boundary) OVER (PARTITION BY user_id ORDER BY session_timestamp) AS session_number,
+        user_id || '-' || cast(SUM(new_event_boundary) OVER (PARTITION BY user_id ORDER BY session_timestamp) AS varchar) AS session_id
+    FROM engagement_intervals ei
+
+    
+-----------------------------------------------------------------------------------        
+CREATE OR REPLACE TABLE ANALYTICS.SANDBOX.landing_page_top_exit_page_base_third_version_2023_06_02  AS
+WITH initial AS (
+SELECT 
+      session_id,
+      user_id,
+      path,
+      session_timestamp,
+      ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY session_timestamp DESC) AS  path_order
+FROM ANALYTICS.SANDBOX.landing_page_base_third_version_2023_06_02
+WHERE path IS NOT NULL    
+ORDER BY 1,2,3,4, 5
+)
+SELECT path AS last_url,
+       TO_DATE(session_timestamp) AS date, 
+       COUNT(*) AS frequency
+FROM initial
+WHERE path_order=1
+GROUP BY path,
+         date
+
+
+
+---------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE ANALYTICS.SANDBOX.landing_page_top_exit_page_third_version_2023_06_02 AS
+SELECT last_url,
+       SUM(frequency) AS total,
+       RANK() OVER (ORDER BY total DESC) AS rank_number
+FROM ANALYTICS.SANDBOX.landing_page_top_exit_page_base_third_version_2023_06_02
+GROUP BY last_url
+
+-----------------------------------------------------------------------------
+CREATE OR REPLACE TABLE ANALYTICS.SANDBOX.landing_page_top_exit_page_daily_2023_06_02 AS
+SELECT exit_base.*,
+       exit_top.rank_number
+FROM ANALYTICS.SANDBOX.landing_page_top_exit_page_base_third_version_2023_06_02 AS exit_base
+JOIN (SELECT * FROM ANALYTICS.SANDBOX.landing_page_top_exit_page_third_version_2023_06_02 WHERE rank_number <= 10) AS exit_top
+     ON exit_base.last_url= exit_top.last_url
+
+
+
+
+
+CREATE OR REPLACE TABLE ANALYTICS.SANDBOX.landing_page_all_2023_06_02 AS
+-- To include only top 1000 URLs 
+WITH top_paths AS (
+SELECT path,
+       COUNT(*)
+FROM ANALYTICS.SANDBOX.landing_page_base_third_version_2023_06_02
+WHERE path is not NULL
+GROUP BY path
+ORDER BY COUNT(*) DESC
+LIMIT 1000
+)
+, transformed AS (
+SELECT
+        session_number||user_id||TO_DATE(date_created) AS session_id,
+        es.user_id,
+        es.path,
+        TO_DATE(es.date_created) AS session_date,
+        MIN(session_timestamp) AS session_start_timestamp,
+        MAX(session_timestamp) AS session_end_timestamp,
+        DATEDIFF(second, MIN(session_timestamp), MAX(session_timestamp)) AS product_engagement_time_seconds,
+        DATEDIFF(minute, MIN(session_timestamp), MAX(session_timestamp)) AS product_engagement_time_minutes
+    FROM
+        ANALYTICS.SANDBOX.landing_page_base_third_version_2023_06_02 es
+    WHERE path IS NOT NULL    
+    GROUP BY
+        1,2,3,4
+)
+-- Have to trunc the text because LISTAGG does not accept long texts: Error: String '(LISTAGG result)' is too long and would be truncated
+, truncated AS (
+SELECT       
+       session_id,       
+       user_id,
+       CASE WHEN LENGTH(path) > 30
+                      THEN LEFT(path, 30) || '...'
+                      ELSE path
+                      END AS truncated_path,
+       session_start_timestamp,
+       product_engagement_time_seconds
+       
+FROM transformed
+WHERE path IS NOT NULL
+      AND path IN (SELECT path FROM top_paths)
+)
+, base AS (
+SELECT       
+       session_id,       
+       user_id,
+       MIN(TO_DATE(session_start_timestamp)) AS session_start_date,
+       listagg(truncated_path , ', ') WITHIN GROUP (ORDER BY session_start_timestamp ASC) AS all_paths,
+       listagg(truncated_path , ', ') WITHIN GROUP (ORDER BY session_start_timestamp DESC) AS all_paths_exit,
+       SUM(product_engagement_time_seconds) AS total_spent_time
+       
+FROM truncated      
+GROUP BY       
+       session_id,       
+       user_id    
+ )
+SELECT 
+      session_start_date,
+      all_paths,
+      all_paths_exit,
+      SUM(total_spent_time) AS total_time_spent_in_seconds,
+      COUNT(*) AS FREQUENCY
+FROM base      
+GROUP BY
+      session_start_date,
+      all_paths,
+      all_paths_exit
+ORDER BY COUNT(*) DESC       
+
+
+
+-------------------------------------------------------------
+CREATE OR REPLACE TABLE ANALYTICS.SANDBOX.landing_page_top_2023_06_02 AS
+SELECT all_paths,
+       SUM(FREQUENCY) AS total,
+       SUM(total_time_spent_in_seconds) AS duration_in_seconds,
+       RANK() OVER (ORDER BY total DESC) AS rank_number
+FROM  ANALYTICS.SANDBOX.landing_page_all_2023_06_02
+GROUP BY all_paths
+ORDER BY total DESC
+
+
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE ANALYTICS.SANDBOX.landing_page_top_daily_2023_06_02 AS
+SELECT land_base.*,
+       land_top.rank_number
+FROM ANALYTICS.SANDBOX.landing_page_all_2023_06_02 AS land_base
+JOIN (SELECT * FROM ANALYTICS.SANDBOX.landing_page_top_2023_06_02 WHERE rank_number <= 10) AS land_top
+     ON land_base.all_paths= land_top.all_paths
+
+     "
+```
+
+## Top Paths (Total)
+
+Notes: <br>
+1- Only top URL(path) are chosen the rest are excluded (Even if existed in All_Path) <br>
+2- If a URL has more than 30 characters then you only see the top 30 characters followed by `...`<br>
+3- It capture data after 2023-01-01
+
+```{r, out.width = "100%"}
+top %>%
+  mutate(Duration_to_Frequency= round(DURATION_IN_SECONDS/TOTAL,2)) %>%
+  select(RANK_NUMBER, everything()) %>%
+  arrange(desc(-RANK_NUMBER)) %>%
+  slice(1:100) %>%
+  select(RANK_NUMBER, everything()) %>%
+  datatable()
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+top_daily <- DBI::dbGetQuery(con,
+"
+SELECT * 
+FROM ANALYTICS.SANDBOX.landing_page_top_current_url_daily
+     ")
+
+```
+
+## Top Paths (Total) - Daily Trends
+
+Note: We are showing the trends for only top 10 overall frequent paths
+
+
+## Top Paths (Total) - Daily Trends Bar Chart
+
+```{r , out.width = "100%",  fig.height= 30}
+top_daily$Full_path <- reorder( top_daily$ALL_PATHS, top_daily$RANK_NUMBER)
+chart <- ggplot(top_daily,
+                aes(x = SESSION_START_DATE, y = FREQUENCY, fill=ALL_PATHS,), color = "black") +
+  geom_bar(stat = "identity") +
+  facet_wrap(. ~ Full_path, ncol=1, labeller = label_both, scales = "free_y") +
+  labs(x = "SESSION START DATE", y = "Frequency") +
+  theme(panel.spacing = unit(4, "lines")) +
+  theme(legend.position="top")
+
+
+plotly_obj <- ggplotly(chart) %>% 
+  layout(
+    legend = list(
+      orientation = 'h', x = 0.3, y = -0.1, 
+      title = list(text = 'Path')
+      )
+    )
+
+plotly_obj
+```
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+top_exit <- DBI::dbGetQuery(con,
+"
+SELECT * 
+FROM ANALYTICS.SANDBOX.landing_page_top_exit_page_current_url
+     ")
+
+```
+
+## Top Last URLs (Total)
+
+```{r, out.width = "100%"}
+top_exit %>%
+  arrange(desc(-RANK_NUMBER)) %>%
+  slice(1:100) %>%
+  select(RANK_NUMBER, LAST_URL, TOTAL) %>%
+  datatable()
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+top_daily_exit <- DBI::dbGetQuery(con,
+"
+SELECT * 
+FROM ANALYTICS.SANDBOX.landing_page_top_exit_page_current_url_daily
+     ")
+
+```
+
+
+
+
+## Top Last URLs (Total) -Dailt Trends
+
+```{r , out.width = "100%",  fig.height= 30}
+top_daily_exit$LAST_URL <- reorder( top_daily_exit$LAST_URL, top_daily_exit$RANK_NUMBER)
+chart <- ggplot(top_daily_exit,
+                aes(x = DATE, y = FREQUENCY, fill=LAST_URL,), color = "black") +
+  geom_bar(stat = "identity") +
+  facet_wrap(. ~ LAST_URL, ncol=1, labeller = label_both, scales = "free_y") +
+  labs(x = "SESSION START DATE", y = "Frequency") +
+  theme(panel.spacing = unit(4, "lines"))
+
+
+plotly_obj <- ggplotly(chart) %>% 
+  layout(
+    legend = list(
+      orientation = 'h', x = 0.3, y = -0.1, 
+      title = list(text = 'Exit Path')
+      )
+    )
+
+plotly_obj
+```
