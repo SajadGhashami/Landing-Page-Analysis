@@ -42,19 +42,14 @@ con <- DBI::dbConnect(odbc::odbc(),
                       #SnowflakeDSIIDriver
                       Driver       = "SnowflakeDSIIDriver",
                       Server       = "ed87949.us-east-1.snowflakecomputing.com",
-                      UID          = "SHINY_APP",
-                      PWD          =  "5UK@cMGTf2xA",
-                      
-                      # UID          = rstudioapi::askForPassword("Database user"),
-                      # PWD          = rstudioapi::askForPassword("Database password"),
+                      UID          = rstudioapi::askForPassword("Database user"),
+                      PWD          = rstudioapi::askForPassword("Database password"),
                       Database     = "EDW",
                       Warehouse    = "shiny_app",
                       Schema       = "dim"
-                      #,
                       #authenticator = "externalbrowser"
                       )
 mywh <- DBI::dbSendQuery(con, 'use role shiny_app_role')
-#mywh <- DBI::dbSendQuery(con, 'use role developer_role')
 mywh <- DBI::dbSendQuery(con, 'use warehouse shiny_app')
 ```
 
@@ -70,7 +65,7 @@ FROM ANALYTICS.SANDBOX.landing_page_top_current_url
 ## Query to create the historical Path
 
 Click `Code/Hide` to Show/hide it
-
+(Snowflake code)
 ```{r eval=FALSE}
 "
 CREATE OR REPLACE TABLE ANALYTICS.SANDBOX.landing_page_base_third_version_2023_06_02 AS
